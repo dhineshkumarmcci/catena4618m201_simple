@@ -60,9 +60,9 @@ using namespace McciCatena;
 |
 \****************************************************************************/
 
-constexpr uint8_t kUplinkPort = 3;
+constexpr uint8_t kUplinkPort = 4;
 
-enum class FlagsSensorPort3 : uint8_t
+enum class FlagsSensorPort4 : uint8_t
         {
         FlagVbat = 1 << 0,
         FlagVcc = 1 << 1,
@@ -70,14 +70,38 @@ enum class FlagsSensorPort3 : uint8_t
         FlagTH = 1 << 3,	// temperature, humidity
         FlagLight = 1 << 4,	// Si1133 "ir", "white", "uv"
         FlagVbus = 1 << 5,	// Vbus input
+        FlagAppState = 1 << 6,	// Vbus input
         };
 
-constexpr FlagsSensorPort3 operator| (const FlagsSensorPort3 lhs, const FlagsSensorPort3 rhs)
+enum class CurrentAppState_t : std::uint8_t
         {
-        return FlagsSensorPort3(uint8_t(lhs) | uint8_t(rhs));
+        powerOnReset = 0,
+        idle,
+        lorawan,
+        poll,
+        readVbat,
+        readUsb,
+        readEnv,
+        checkLight,
+        readLight,
+        sendBufferDone,
+        settleDone,
+        txNotProvisioned,
+        deepSleepPrepare,
+        doDeepSleep,
+        deepSleepRecovery,
+        doLightSleep,
+        sleepDone,
+        receiveMessage,
+        invalid = 24
         };
 
-FlagsSensorPort3 operator|= (FlagsSensorPort3 &lhs, const FlagsSensorPort3 &rhs)
+constexpr FlagsSensorPort4 operator| (const FlagsSensorPort4 lhs, const FlagsSensorPort4 rhs)
+        {
+        return FlagsSensorPort4(uint8_t(lhs) | uint8_t(rhs));
+        };
+
+FlagsSensorPort4 operator|= (FlagsSensorPort4 &lhs, const FlagsSensorPort4 &rhs)
         {
         lhs = lhs | rhs;
         return lhs;
@@ -117,6 +141,9 @@ constexpr uint32_t CATCFG_GetInterval(uint32_t tCycle)
 enum    {
         CATCFG_T_INTERVAL = CATCFG_GetInterval(CATCFG_T_CYCLE),
         };
+
+void setCurrentState(CurrentAppState_t state);
+CurrentAppState_t getSavedState(void);
 
 // forwards
 static void settleDoneCb(osjob_t *pSendJob);
@@ -210,7 +237,8 @@ unsigned gTxCycle;
 // remaining before we reset to default
 unsigned gTxCycleCount;
 
-
+// the state of the last run
+CurrentAppState_t gLastRunState = CurrentAppState_t::invalid;
 
 /*
 
@@ -238,6 +266,19 @@ Returns:
 
 void setup(void)
         {
+        const uint32_t resetReason = READ_REG(RCC->CSR);
+
+        if (resetReason & RCC_CSR_PINRSTF)
+                {
+                /* get the saved state (from last run), and put it in a global to accompany uplinks */
+                gLastRunState = getSavedState();
+                }
+        else
+                {
+                /* assign if power-on reset, and put it in a global to accompany uplinks */
+                gLastRunState = CurrentAppState_t::powerOnReset;
+                }
+
         gCatena.begin();
 
         setup_platform();
@@ -259,6 +300,10 @@ void setup_platform(void)
                         yield();
                 }
 #endif
+
+        /* enable access to backup */
+        __HAL_RCC_PWR_CLK_ENABLE();
+        HAL_PWR_EnableBkUpAccess();
 
         gCatena.SafePrintf("\n");
         gCatena.SafePrintf("-------------------------------------------------------------------------------\n");
@@ -311,6 +356,8 @@ void setup_platform(void)
                 }
 
         gCatena.registerObject(&gLoRaWAN);
+
+        gCatena.SafePrintf("App Last Run State: %u\n", gLastRunState);
 
         /* find the platform */
         const Catena::EUI64_buffer_t *pSysEUI = gCatena.GetSysEUI();
@@ -414,6 +461,59 @@ void setup_uplink(void)
                 }
         }
 
+/*
+
+Name:   setCurrentState()
+
+Function:
+        Write the current "state" to FRAM, for debug purposes.
+
+Definition:
+        void setCurrentState(CurrentAppState_t state);
+
+Description:
+        CurrentAppState_t is an 8-bit value. We merge it into unused bits of
+        the operating flags mask, so that on reboot we can display it (and
+        uplink it in case we miss the display).
+
+Returns:
+        No explicit result.
+
+*/
+
+#define RTC_BKP1R       (UINT32_C(0x40002800) + 0x54)   // addrress of BKP1R
+void put32(uint32_t reg, uint32_t v)
+        {
+        volatile uint32_t * const p = (uint32_t *)reg;
+        *p = v;
+        }
+uint32_t get32(uint32_t reg)
+        {
+        volatile const uint32_t * const p = (uint32_t *)reg;
+        return *p;
+        }
+
+void setCurrentState(CurrentAppState_t state)
+        {
+        std::uint32_t v = std::uint32_t(state);
+        // we write state to BKP1R[0..7], and ~state to BKP1R[8..15] as a check
+        v |= (~v & 0xFF) << 8;
+
+        put32(RTC_BKP1R, v);
+        }
+
+CurrentAppState_t getSavedState(void)
+        {
+        auto v = get32(RTC_BKP1R);
+        if ((v & 0xFF) != ~(((v >> 8) & 0xFF) | 0xFFFFFF00)){
+                return CurrentAppState_t(CurrentAppState_t::invalid);
+                }
+        else
+               {
+               return CurrentAppState_t(v & 0xFF);
+               }
+        }
+
 // The Arduino loop routine -- in our case, we just drive the other loops.
 // If we try to do too much, we can break the LMIC radio. So the work is
 // done by outcalls scheduled from the LMIC os loop.
@@ -421,7 +521,9 @@ void fillBuffer(TxBuffer_t &b);
 
 void loop()
         {
+        setCurrentState(CurrentAppState_t::poll);
         gCatena.poll();
+        setCurrentState(CurrentAppState_t::idle);
 
         /* for mfg test, don't tx, just fill -- this causes output to Serial */
         if (gCatena.GetOperatingFlags() &
@@ -440,21 +542,23 @@ void fillBuffer(TxBuffer_t &b)
                 gSi1133.start(true);
 
         b.begin();
-        FlagsSensorPort3 flag;
+        FlagsSensorPort4 flag;
 
-        flag = FlagsSensorPort3(0);
+        flag = FlagsSensorPort4(0);
 
         // we have no format byte for this.
         uint8_t * const pFlag = b.getp();
         b.put(0x00); /* will be set to the flags */
 
         // vBat is sent as 5000 * v
+        setCurrentState(CurrentAppState_t::readVbat);
         float vBat = gCatena.ReadVbat();
         gCatena.SafePrintf("vBat:    %d mV\n", (int) (vBat * 1000.0f));
         b.putV(vBat);
-        flag |= FlagsSensorPort3::FlagVbat;
+        flag |= FlagsSensorPort4::FlagVbat;
 
         // vBus is sent as 5000 * v
+        setCurrentState(CurrentAppState_t::readUsb);
         float vBus = gCatena.ReadVbus();
         gCatena.SafePrintf("vBus:    %d mV\n", (int) (vBus * 1000.0f));
         fUsbPower = (vBus > 3.0) ? true : false;
@@ -463,11 +567,12 @@ void fillBuffer(TxBuffer_t &b)
         if (gCatena.getBootCount(bootCount))
                 {
                 b.putBootCountLsb(bootCount);
-                flag |= FlagsSensorPort3::FlagBoot;
+                flag |= FlagsSensorPort4::FlagBoot;
                 }
 
         if (fTemperatureSensor)
                 {
+                setCurrentState(CurrentAppState_t::readEnv);
                 cTemperatureSensor::Measurements m;
                 bool fResult = gTemperatureSensor.getTemperatureHumidity(m);
 
@@ -485,7 +590,7 @@ void fillBuffer(TxBuffer_t &b)
                         // no method for 2-byte RH, direct encode it.
                         b.put2uf((m.Humidity / 100.0f) * 65535.0f);
 
-                        flag |= FlagsSensorPort3::FlagTH;
+                        flag |= FlagsSensorPort4::FlagTH;
                         }
                 else
                         {
@@ -500,11 +605,13 @@ void fillBuffer(TxBuffer_t &b)
                 /* Get a new sensor event */
                 uint16_t data[3];
 
+                setCurrentState(CurrentAppState_t::checkLight);
                 while (! gSi1133.isOneTimeReady())
                         {
                         yield();
                         }
 
+                setCurrentState(CurrentAppState_t::readLight);
                 gSi1133.readMultiChannelData(data, 3);
                 gSi1133.stop();
                 gCatena.SafePrintf(
@@ -518,11 +625,14 @@ void fillBuffer(TxBuffer_t &b)
                 b.putLux(data[1]);
                 b.putLux(data[2]);
 
-                flag |= FlagsSensorPort3::FlagLight;
+                flag |= FlagsSensorPort4::FlagLight;
                 }
 
         b.putV(vBus);
-        flag |= FlagsSensorPort3::FlagVbus;
+        flag |= FlagsSensorPort4::FlagVbus;
+
+        b.put(uint8_t(gLastRunState));
+        flag |= FlagsSensorPort4::FlagAppState;
 
         *pFlag = uint8_t(flag);
         }
@@ -546,6 +656,7 @@ void startSendingUplink(void)
                 fConfirmed = true;
                 }
 
+        setCurrentState(CurrentAppState_t::lorawan);
         gLoRaWAN.SendBuffer(b.getbase(), b.getn(), sendBufferDoneCb, NULL, fConfirmed, kUplinkPort);
         }
 
@@ -557,6 +668,8 @@ static void sendBufferDoneCb(
         osjobcb_t pFn;
 
         gLed.Set(LedPattern::Settling);
+
+        setCurrentState(CurrentAppState_t::sendBufferDone);
 
         pFn = settleDoneCb;
         if (! fStatus)
@@ -584,6 +697,7 @@ static void txNotProvisionedCb(
         osjob_t *pSendJob
         )
         {
+        setCurrentState(CurrentAppState_t::txNotProvisioned);
         gCatena.SafePrintf("LoRaWAN not provisioned yet. Use the commands to set it up.\n");
         gLoRaWAN.Shutdown();
         gLed.Set(LedPattern::NotProvisioned);
@@ -593,6 +707,7 @@ static void settleDoneCb(
         osjob_t *pSendJob
         )
         {
+        setCurrentState(CurrentAppState_t::settleDone);
         const bool fDeepSleep = checkDeepSleep();
 
         if (uint32_t(millis()) > gRebootMs)
@@ -725,6 +840,7 @@ void doDeepSleep(osjob_t *pJob)
         gLed.Set(LedPattern::Off);
         deepSleepPrepare();
 
+        setCurrentState(CurrentAppState_t::doDeepSleep);
         /* sleep */
         gCatena.Sleep(sleepInterval);
 
@@ -737,6 +853,8 @@ void doDeepSleep(osjob_t *pJob)
 
 void deepSleepPrepare(void)
         {
+        setCurrentState(CurrentAppState_t::deepSleepPrepare);
+
         Serial.end();
         Wire.end();
         SPI.end();
@@ -746,6 +864,8 @@ void deepSleepPrepare(void)
 
 void deepSleepRecovery(void)
         {
+        setCurrentState(CurrentAppState_t::deepSleepRecovery);
+
         Serial.begin();
         Wire.begin();
         SPI.begin();
@@ -766,6 +886,7 @@ void doLightSleep(osjob_t *pJob)
                 }
 
         gLed.Set(LedPattern::Sleeping);
+        setCurrentState(CurrentAppState_t::doLightSleep);
         os_setTimedCallback(
                 &sensorJob,
                 os_getTime() + interval,
@@ -778,6 +899,7 @@ static void sleepDoneCb(
         )
         {
         gLed.Set(LedPattern::WarmingUp);
+        setCurrentState(CurrentAppState_t::sleepDone);
 
         os_setTimedCallback(
                 &sensorJob,
@@ -802,6 +924,8 @@ static void receiveMessage(
         {
         unsigned txCycle;
         unsigned txCount;
+
+        setCurrentState(CurrentAppState_t::receiveMessage);
 
         if (port == 0)
                 {
